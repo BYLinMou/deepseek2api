@@ -1095,7 +1095,7 @@ After calling tools, you will receive the results and can continue the conversat
                                             if "p" in chunk and chunk.get("p") == "response/search_status":
                                                 continue
                                                 
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                            if "p" in chunk and chunk.get("p") in ["response/thinking_content", "response/reasoning_content"]:
                                                 ptype = "thinking"
                                             elif "p" in chunk and chunk.get("p") == "response/content":
                                                 ptype = "text"
@@ -1375,7 +1375,7 @@ After calling tools, you will receive the results and can continue the conversat
                                     if "p" in chunk and chunk.get("p") == "response/search_status":
                                         continue
                                                 
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                    if "p" in chunk and chunk.get("p") in ["response/thinking_content", "response/reasoning_content"]:
                                         ptype = "thinking"
                                     elif "p" in chunk and chunk.get("p") == "response/content":
                                         ptype = "text"
@@ -1900,7 +1900,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                     
                                 # 判断内容类型
                                 ptype = "text"
-                                if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                if "p" in chunk and chunk.get("p") in ["response/thinking_content", "response/reasoning_content"]:
                                     ptype = "thinking"
                                 elif "p" in chunk and chunk.get("p") == "response/content":
                                     ptype = "text"
