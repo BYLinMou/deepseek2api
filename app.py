@@ -107,7 +107,7 @@ BASE_HEADERS = {
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
     "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
+    "x-client-version": "2.0.0",
     "x-client-locale": "zh_CN",
     "accept-charset": "UTF-8",
 }
@@ -471,7 +471,15 @@ def create_session(request: Request, max_attempts=3):
             logger.error(f"[create_session] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            session_id = data["data"]["biz_data"]["id"]
+            response_data = data.get("data") or {}
+            biz_data = response_data.get("biz_data") or {}
+            chat_session = biz_data.get("chat_session") or {}
+            session_id = biz_data.get("id") or chat_session.get("id")
+            if not session_id:
+                logger.error(f"[create_session] 响应中缺少会话 id: {data}")
+                resp.close()
+                attempts += 1
+                continue
 
             resp.close()
             return session_id
