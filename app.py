@@ -884,6 +884,145 @@ def detect_and_parse_tool_calls(content: str):
     return None, content
 
 
+def format_deepseek_fragment_as_reasoning(fragment: dict, event_name: str = "fragment") -> str:
+    """Turn DeepSeek internal non-response fragments into readable reasoning text."""
+    if not isinstance(fragment, dict):
+        return ""
+
+    fragment_type = str(fragment.get("type") or "TOOL").upper()
+    if not fragment_type.startswith("TOOL"):
+        return ""
+
+    lines = [f"[{fragment_type.lower()}] {fragment.get('status') or event_name}"]
+
+    queries = fragment.get("queries")
+    if isinstance(queries, list) and queries:
+        query_texts = []
+        for query in queries:
+            if isinstance(query, dict):
+                q = query.get("query")
+                if q:
+                    query_texts.append(str(q))
+            elif query:
+                query_texts.append(str(query))
+        if query_texts:
+            lines.append("queries: " + "; ".join(query_texts))
+
+    results = fragment.get("results")
+    if isinstance(results, list) and results:
+        lines.append("results:")
+        for result in results[:10]:
+            if not isinstance(result, dict):
+                continue
+            title = result.get("title") or result.get("url") or "untitled"
+            url = result.get("url")
+            lines.append(f"- {title} ({url})" if url else f"- {title}")
+
+    content = fragment.get("content")
+    if content:
+        lines.append(str(content))
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def append_deepseek_fragment(fragment: dict, state: dict):
+    """Extract OpenAI-compatible deltas from one DeepSeek response fragment."""
+    if not isinstance(fragment, dict):
+        return []
+
+    fragment_type = str(fragment.get("type") or "").upper()
+    content = fragment.get("content")
+
+    if fragment_type in ("THINK", "THINKING"):
+        state["ptype"] = "thinking"
+        state["fragment_type"] = fragment_type
+        return [("thinking", content)] if isinstance(content, str) and content else []
+
+    if fragment_type == "RESPONSE":
+        state["ptype"] = "text"
+        state["fragment_type"] = fragment_type
+        return [("text", content)] if isinstance(content, str) and content else []
+
+    if fragment_type:
+        state["ptype"] = "thinking"
+        state["fragment_type"] = fragment_type
+        reasoning = format_deepseek_fragment_as_reasoning(fragment, "start")
+        return [("thinking", reasoning)] if reasoning else []
+
+    return []
+
+
+def parse_deepseek_sse_chunk(chunk: dict, state: dict):
+    """Parse old and fragment-based DeepSeek SSE chunks into (type, text) deltas."""
+    deltas = []
+    done = False
+
+    if not isinstance(chunk, dict) or "v" not in chunk:
+        return deltas, done
+
+    path = chunk.get("p")
+    op = chunk.get("o")
+    value = chunk.get("v")
+
+    if isinstance(value, dict) and isinstance(value.get("response"), dict):
+        response = value["response"]
+        for fragment in response.get("fragments") or []:
+            deltas.extend(append_deepseek_fragment(fragment, state))
+        if response.get("status") == "FINISHED":
+            done = True
+        return deltas, done
+
+    if path == "response/status":
+        return deltas, value == "FINISHED"
+    if path in ("response/search_status", "response/has_pending_fragment"):
+        return deltas, False
+
+    if path == "response/thinking_content":
+        state["ptype"] = "thinking"
+    elif path == "response/content":
+        state["ptype"] = "text"
+    elif path == "response/fragments" and op == "APPEND" and isinstance(value, list):
+        for fragment in value:
+            deltas.extend(append_deepseek_fragment(fragment, state))
+        return deltas, False
+    elif path == "response" and op == "BATCH" and isinstance(value, list):
+        for item in value:
+            item_path = item.get("p")
+            item_value = item.get("v")
+            if item_path == "status" and item_value == "FINISHED":
+                done = True
+            elif item_path == "fragments" and item.get("o") == "APPEND" and isinstance(item_value, list):
+                for fragment in item_value:
+                    deltas.extend(append_deepseek_fragment(fragment, state))
+        return deltas, done
+    elif isinstance(path, str) and path.startswith("response/fragments/"):
+        if path.endswith("/content"):
+            if state.get("fragment_type") == "RESPONSE":
+                state["ptype"] = "text"
+            else:
+                state["ptype"] = "thinking"
+        elif path.endswith("/status"):
+            return deltas, False
+        elif path.endswith("/results") and isinstance(value, list):
+            state["ptype"] = "thinking"
+            reasoning = format_deepseek_fragment_as_reasoning(
+                {"type": state.get("fragment_type", "TOOL_SEARCH"), "results": value},
+                "results",
+            )
+            return ([("thinking", reasoning)] if reasoning else deltas), False
+        else:
+            return deltas, False
+
+    if isinstance(value, str):
+        deltas.append((state.get("ptype", "text"), value))
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict) and item.get("p") == "status" and item.get("v") == "FINISHED":
+                done = True
+
+    return deltas, done
+
+
 # ----------------------------------------------------------------------
 # (10) 路由：/v1/chat/completions
 # ----------------------------------------------------------------------
@@ -1049,7 +1188,9 @@ After calling tools, you will receive the results and can continue the conversat
                             logger.warning(f"[sse_stream] 调用 delete_session 失败: {e}")
 
                     def process_data():
-                        ptype = "text"
+                        initial_ptype = "thinking" if thinking_enabled else "text"
+                        parse_state = {"ptype": initial_ptype}
+                        ptype = initial_ptype
                         try:
                             for raw_line in deepseek_resp.iter_lines():
                                 try:
@@ -1080,6 +1221,28 @@ After calling tools, you will receive the results and can continue the conversat
                                         if "response_message_id" in chunk:
                                             response_message_id = chunk["response_message_id"]
                                         
+                                        deltas, done = parse_deepseek_sse_chunk(chunk, parse_state)
+                                        if deltas or done:
+                                            for parsed_type, parsed_content in deltas:
+                                                result_queue.put({
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "content": parsed_content,
+                                                            "type": parsed_type
+                                                        }
+                                                    }],
+                                                    "model": "",
+                                                    "chunk_token_usage": len(parsed_content) // 4,
+                                                    "created": 0,
+                                                    "message_id": -1,
+                                                    "parent_id": -1
+                                                })
+                                            if done:
+                                                result_queue.put(None)
+                                                break
+                                            continue
+
                                         if "v" in chunk:
                                             v_value = chunk["v"]
                                             
@@ -1338,7 +1501,9 @@ After calling tools, you will receive the results and can continue the conversat
 
             def collect_data():
                 nonlocal result
-                ptype = "text"
+                initial_ptype = "thinking" if thinking_enabled else "text"
+                parse_state = {"ptype": initial_ptype}
+                ptype = initial_ptype
                 try:
                     for raw_line in deepseek_resp.iter_lines():
                         try:
@@ -1361,6 +1526,20 @@ After calling tools, you will receive the results and can continue the conversat
                                 break
                             try:
                                 chunk = json.loads(data_str)
+
+                                deltas, done = parse_deepseek_sse_chunk(chunk, parse_state)
+                                if deltas or done:
+                                    for parsed_type, parsed_content in deltas:
+                                        if search_enabled and parsed_content.startswith("[citation:"):
+                                            continue
+                                        if parsed_type == "thinking":
+                                            think_list.append(parsed_content)
+                                        else:
+                                            text_list.append(parsed_content)
+                                    if done:
+                                        data_queue.put(None)
+                                        break
+                                    continue
             
                                 # 提取 v 字段
                                 if "v" in chunk:
