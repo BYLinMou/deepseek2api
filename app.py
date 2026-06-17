@@ -1215,7 +1215,7 @@ After calling tools, you will receive the results and can continue the conversat
         upstream_error = parse_upstream_error_line(first_line_text)
         if upstream_error:
             deepseek_resp.close()
-            return JSONResponse(status_code=401, content={"error": upstream_error})
+            return JSONResponse(status_code=403, content={"error": upstream_error})
         upstream_lines = prepend_iter(first_upstream_line, upstream_iter)
 
         # 流式响应（SSE）或普通响应
@@ -2024,8 +2024,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
         if upstream_error:
             deepseek_resp.close()
             return JSONResponse(
-                status_code=401,
-                content={"error": {"type": "authentication_error", "message": upstream_error}},
+                status_code=403,
+                content={"error": {"type": "permission_error", "message": upstream_error}},
             )
         upstream_lines = prepend_iter(first_upstream_line, upstream_iter)
 
