@@ -67,6 +67,43 @@ def save_config(cfg):
         logger.error(f"[save_config] 写入 config.json 失败: {e}")
 
 
+def upstream_error_message(data):
+    payload = data.get("data") or {}
+    biz_msg = payload.get("biz_msg") or data.get("msg") or "upstream error"
+    biz_code = payload.get("biz_code")
+    biz_data = payload.get("biz_data") or {}
+    suffix = ""
+    if "mute_until" in biz_data:
+        suffix = f", mute_until={biz_data.get('mute_until')}"
+    return f"DeepSeek upstream error: biz_code={biz_code}, biz_msg={biz_msg}{suffix}"
+
+
+def parse_upstream_error_line(line):
+    line = line.strip()
+    if line.startswith("data:"):
+        line = line[5:].strip()
+    elif not line.startswith("{"):
+        return None
+    if not line or line == "[DONE]":
+        return None
+    try:
+        data = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data_block = data.get("data") or {}
+    if data.get("code") not in (None, 0) or data_block.get("biz_code") not in (None, 0):
+        return upstream_error_message(data)
+    return None
+
+
+def prepend_iter(first_item, iterator):
+    if first_item is not None:
+        yield first_item
+    yield from iterator
+
+
 CONFIG = load_config()
 
 # -------------------------- 全局账号队列 --------------------------
@@ -407,10 +444,13 @@ async def call_claude_via_openai(request: Request, claude_payload):
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": "default",
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "action": None,
+            "preempt": False,
         }
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
@@ -457,7 +497,7 @@ def create_session(request: Request, max_attempts=3):
         headers = get_auth_headers(request)
         try:
             resp = requests.post(
-                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={"agent": "chat"}, impersonate="safari15_3"
+                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={}, impersonate="safari15_3"
             )
         except Exception as e:
             logger.error(f"[create_session] 请求异常: {e}")
@@ -1135,10 +1175,13 @@ After calling tools, you will receive the results and can continue the conversat
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": "default",
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "action": None,
+            "preempt": False,
         }
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
@@ -1146,6 +1189,34 @@ After calling tools, you will receive the results and can continue the conversat
             raise HTTPException(status_code=500, detail="Failed to get completion.")
         created_time = int(time.time())
         completion_id = f"{session_id}"
+        upstream_iter = deepseek_resp.iter_lines()
+        try:
+            first_upstream_line = next(upstream_iter)
+        except StopIteration:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": "DeepSeek upstream returned an empty response."},
+            )
+        except Exception as exc:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Failed to read DeepSeek upstream response: {exc}"},
+            )
+        try:
+            first_line_text = first_upstream_line.decode("utf-8")
+        except Exception as exc:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Failed to decode DeepSeek upstream response: {exc}"},
+            )
+        upstream_error = parse_upstream_error_line(first_line_text)
+        if upstream_error:
+            deepseek_resp.close()
+            return JSONResponse(status_code=401, content={"error": upstream_error})
+        upstream_lines = prepend_iter(first_upstream_line, upstream_iter)
 
         # 流式响应（SSE）或普通响应
         if bool(req_data.get("stream", False)):
@@ -1192,9 +1263,11 @@ After calling tools, you will receive the results and can continue the conversat
                         parse_state = {"ptype": initial_ptype}
                         ptype = initial_ptype
                         try:
-                            for raw_line in deepseek_resp.iter_lines():
+                            for raw_line in upstream_lines:
+                                # logger.warning(f"[upstream_sse][chat_stream][raw] {raw_line!r}")
                                 try:
                                     line = raw_line.decode("utf-8")
+                                    # logger.warning(f"[upstream_sse][chat_stream][line] {line}")
                                 except Exception as e:
                                     logger.warning(f"[sse_stream] 解码失败: {e}")
                                     # 根据当前模式决定错误消息类型
@@ -1210,8 +1283,52 @@ After calling tools, you will receive the results and can continue the conversat
                                     break
                                 if not line:
                                     continue
+                                if line.startswith("{"):
+                                    try:
+                                        maybe_error = json.loads(line)
+                                        data_block = maybe_error.get("data") or {}
+                                        if maybe_error.get("code") not in (None, 0) or data_block.get("biz_code") not in (None, 0):
+                                            error_text = upstream_error_message(maybe_error)
+                                            result_queue.put({
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {"content": error_text, "type": "text"}
+                                                }],
+                                                "model": "",
+                                                "chunk_token_usage": len(error_text) // 4,
+                                                "created": 0,
+                                                "message_id": -1,
+                                                "parent_id": -1
+                                            })
+                                            result_queue.put(None)
+                                            break
+                                    except Exception:
+                                        pass
                                 if line.startswith("data:"):
                                     data_str = line[5:].strip()
+                                    try:
+                                        maybe_error = json.loads(data_str)
+                                        if isinstance(maybe_error, dict):
+                                            code = maybe_error.get("code")
+                                            data_block = maybe_error.get("data") or {}
+                                            biz_code = data_block.get("biz_code")
+                                            if code not in (None, 0) or biz_code not in (None, 0):
+                                                error_text = upstream_error_message(maybe_error)
+                                                result_queue.put({
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": error_text, "type": "text"}
+                                                    }],
+                                                    "model": "",
+                                                    "chunk_token_usage": len(error_text) // 4,
+                                                    "created": 0,
+                                                    "message_id": -1,
+                                                    "parent_id": -1
+                                                })
+                                                result_queue.put(None)
+                                                break
+                                    except Exception:
+                                        pass
                                     if data_str == "[DONE]":
                                         result_queue.put(None)  # 结束信号
                                         break
@@ -1505,9 +1622,11 @@ After calling tools, you will receive the results and can continue the conversat
                 parse_state = {"ptype": initial_ptype}
                 ptype = initial_ptype
                 try:
-                    for raw_line in deepseek_resp.iter_lines():
+                    for raw_line in upstream_lines:
+                        # logger.warning(f"[upstream_sse][chat_nonstream][raw] {raw_line!r}")
                         try:
                             line = raw_line.decode("utf-8")
+                            # logger.warning(f"[upstream_sse][chat_nonstream][line] {line}")
                         except Exception as e:
                             logger.warning(f"[chat_completions] 解码失败: {e}")
                             # 根据当前处理类型添加错误消息
@@ -1519,8 +1638,38 @@ After calling tools, you will receive the results and can continue the conversat
                             break
                         if not line:
                             continue
+                        if line.startswith("{"):
+                            try:
+                                maybe_error = json.loads(line)
+                                data_block = maybe_error.get("data") or {}
+                                if maybe_error.get("code") not in (None, 0) or data_block.get("biz_code") not in (None, 0):
+                                    error_text = upstream_error_message(maybe_error)
+                                    if ptype == "thinking":
+                                        think_list.append(error_text)
+                                    else:
+                                        text_list.append(error_text)
+                                    data_queue.put(None)
+                                    break
+                            except Exception:
+                                pass
                         if line.startswith("data:"):
                             data_str = line[5:].strip()
+                            try:
+                                maybe_error = json.loads(data_str)
+                                if isinstance(maybe_error, dict):
+                                    code = maybe_error.get("code")
+                                    data_block = maybe_error.get("data") or {}
+                                    biz_code = data_block.get("biz_code")
+                                    if code not in (None, 0) or biz_code not in (None, 0):
+                                        error_text = upstream_error_message(maybe_error)
+                                        if ptype == "thinking":
+                                            think_list.append(error_text)
+                                        else:
+                                            text_list.append(error_text)
+                                        data_queue.put(None)
+                                        break
+                            except Exception:
+                                pass
                             if data_str == "[DONE]":
                                 data_queue.put(None)
                                 break
