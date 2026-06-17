@@ -1997,7 +1997,38 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
             raise HTTPException(status_code=500, detail="Failed to get Claude response.")
 
         created_time = int(time.time())
-        
+        upstream_iter = deepseek_resp.iter_lines()
+        try:
+            first_upstream_line = next(upstream_iter)
+        except StopIteration:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "api_error", "message": "DeepSeek upstream returned an empty response."}},
+            )
+        except Exception as exc:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "api_error", "message": f"Failed to read DeepSeek upstream response: {exc}"}},
+            )
+        try:
+            first_line_text = first_upstream_line.decode("utf-8")
+        except Exception as exc:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "api_error", "message": f"Failed to decode DeepSeek upstream response: {exc}"}},
+            )
+        upstream_error = parse_upstream_error_line(first_line_text)
+        if upstream_error:
+            deepseek_resp.close()
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"type": "authentication_error", "message": upstream_error}},
+            )
+        upstream_lines = prepend_iter(first_upstream_line, upstream_iter)
+
         # 处理响应
         if deepseek_resp.status_code != 200:
             deepseek_resp.close()
@@ -2019,7 +2050,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                     response_completed = False
                     
                     # 解析DeepSeek流式响应
-                    for line in deepseek_resp.iter_lines():
+                    for line in upstream_lines:
                         if not line:
                             continue
                         try:
@@ -2200,7 +2231,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                 final_content = ""
                 final_reasoning = ""
                 
-                for line in deepseek_resp.iter_lines():
+                for line in upstream_lines:
                     if not line:
                         continue
                     
